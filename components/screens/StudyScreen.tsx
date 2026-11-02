@@ -91,36 +91,10 @@ export default function StudyScreen() {
   );
 }
 
-/** Minutes studied since midnight, from your study sessions. */
+/** Minutes studied since midnight, from your study sessions (kept in this browser). */
 function TodayTotal() {
-  const { supabase, me, session } = useBooth();
-  const [past, setPast] = useState<number | null>(null);
+  const { studyLog, session, loading } = useBooth();
   const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (!me) return;
-    const midnight = new Date();
-    midnight.setHours(0, 0, 0, 0);
-    let live = true;
-    void supabase
-      .from("study_sessions")
-      .select("id, started_at, ended_at, last_seen_at")
-      .eq("user_id", me.id)
-      .gte("started_at", midnight.toISOString())
-      .then(({ data }) => {
-        if (!live) return;
-        let ms = 0;
-        for (const s of data ?? []) {
-          if (s.id === session?.id) continue; // the running one is counted live below
-          const end = s.ended_at ?? s.last_seen_at ?? s.started_at;
-          ms += Math.max(0, new Date(end as string).getTime() - new Date(s.started_at as string).getTime());
-        }
-        setPast(ms);
-      });
-    return () => {
-      live = false;
-    };
-  }, [supabase, me, session]);
 
   useEffect(() => {
     if (!session) return;
@@ -128,7 +102,12 @@ function TodayTotal() {
     return () => window.clearInterval(t);
   }, [session]);
 
-  if (past === null) return null;
+  if (loading) return null;
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  const past = studyLog
+    .filter((s) => s.startedAt >= midnight.getTime())
+    .reduce((ms, s) => ms + Math.max(0, s.endedAt - s.startedAt), 0);
   const total = past + (session ? Math.max(0, now - session.startedAt) : 0);
   const mins = Math.round(total / 60_000);
   return (
