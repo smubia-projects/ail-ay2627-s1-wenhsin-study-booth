@@ -2,7 +2,7 @@
 // judges the image and the text together. Text in images or typed by users is
 // wrapped in tags and treated strictly as data to classify.
 import { z } from "zod";
-import { askJson, asData, imageBlock } from "@/lib/ai";
+import { askJson, asData, imageBlock, type ContentPart } from "./ai";
 
 export const ModerationSchema = z.object({
   readText: z.string().describe("All handwriting or text visible in the image, transcribed exactly. Empty if none."),
@@ -45,7 +45,7 @@ Allow (allowed=true, category "ok") everything else, including: study selfies, d
 reason: one short, warm sentence addressed to the sender. If blocked, gently say why without quoting the problem words.`;
 
 export async function moderatePost(input: { imageBase64?: string; typedText?: string; timeoutMs?: number }): Promise<Moderation> {
-  const content: Parameters<typeof askJson>[0]["content"] = [];
+  const content: ContentPart[] = [];
   if (input.imageBase64) content.push(imageBlock(input.imageBase64));
   content.push({
     type: "text",
@@ -54,5 +54,5 @@ export async function moderatePost(input: { imageBase64?: string; typedText?: st
       asData("typed_text", input.typedText?.trim() || "(none)"),
     ].join("\n\n"),
   });
-  return askJson({ system: SYSTEM, content, schema: ModerationSchema, timeoutMs: input.timeoutMs ?? 15_000, effort: "low" });
+  return askJson({ system: SYSTEM, content, schema: ModerationSchema, timeoutMs: input.timeoutMs ?? 15_000, purpose: "vision" });
 }
