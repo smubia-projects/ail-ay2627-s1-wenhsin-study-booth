@@ -4,6 +4,33 @@
 
 Built for the AI Lodge Hackathon (track: Projects for Daily Life).
 
+> **AI Lodge showcase.** This fork is deployed as a public demo by the SMU BIA AI Lodge. What is deployed:
+>
+> * **App** (Next.js, `app/` + `components/` + `lib/`) on Vercel, frontend-only. It calls the API at
+>   `NEXT_PUBLIC_API_BASE`.
+> * **API** (`server/`, Express bundled with esbuild) on Google Cloud Run: `POST /api/moderate`, `/api/caption` and
+>   `/api/weekly-story`, using the same prompts and zod schemas (`lib/moderation.ts`, `lib/captions.ts`,
+>   `lib/story.ts`). The post image travels in the request body and nothing is stored on the server.
+>
+> What changed for the showcase:
+>
+> * **No accounts, no database.** Your posts (and their images), reveals, reports, name and study sessions live in
+>   this browser's `localStorage`. Instead of realtime friend groups there is one seeded demo group with three friends
+>   whose fog posts ship with the app (`public/demo/`, made from the red-team "ok" images), so the feed, stories and
+>   scratch-to-reveal work for a single visitor. A post counts as shared only when moderation approves it (still fails
+>   closed).
+> * **AI through any OpenAI-compatible gateway** (`API_BASE_URL`, `API_KEY`, `MODEL_NAME`, `VISION_MODEL_NAME`) with the
+>   schema in the prompt and the same zod validation, instead of the Anthropic SDK's structured outputs.
+> * **AI only on a click.** Caption ideas come from a "Suggest captions" button (they were fetched automatically), and
+>   the automatic group check-ins (asked every 5 minutes) are left out. The weekly story is counted from your study
+>   timer in this browser plus the demo friends' week, then written by the AI.
+> * **AI Lodge rate limit** on every AI route; over the limit the app shows the AI Lodge card and the AI step stops
+>   (an unchecked post is not shared).
+> * A notice on the landing card and the New post screen says that posts are sent to an AI model. The pop-out
+>   study widget (Document Picture-in-Picture) needs **Chrome or Edge**; other browsers keep the in-page timer.
+> * The original Supabase code (auth, groups, Realtime, storage, the Next.js API routes, check-ins) is kept in
+>   `original-supabase/` and `supabase/`, not deployed.
+
 ---
 
 ## 1. Problem Statement
@@ -86,7 +113,27 @@ Check-ins are rate-limited in the database to at most one per group every 45 min
 
 ## 6. Installation & Setup
 
+### Showcase version (this fork)
+
+You need **Node.js 22+** and an OpenAI-compatible API key (no Supabase).
+
+```bash
+npm install
+cp .env.example .env            # API: API_KEY, API_BASE_URL, VISION_MODEL_NAME, ...
+echo NEXT_PUBLIC_API_BASE=http://localhost:8080 > .env.local
+npm run dev:server              # the API on http://localhost:8080
+npm run dev                     # the app on http://localhost:3000 (Chrome or Edge for the pop-out widget)
+npm run redteam                 # optional: the red-team suite against the running API
+```
+
+Deploy: the API builds from the `Dockerfile` (Cloud Run, `.github/workflows/deploy.yml`); the app is imported on
+Vercel with `NEXT_PUBLIC_API_BASE` set to the API's URL.
+
+### Original version (Supabase)
+
 You need **Node.js 20+**, a **Supabase** project and an **Anthropic-compatible** API key.
+
+The original needs the files in `original-supabase/` moved back into place.
 
 1. **Install**
    ```bash
