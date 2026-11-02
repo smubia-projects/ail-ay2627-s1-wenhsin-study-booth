@@ -14,6 +14,9 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Vendored MediaPipe runtime (copied by scripts/copy-mediapipe.mjs).
     "public/mediapipe/**",
+    // The API bundle (npm run build:server) and the original Supabase code (not deployed).
+    "server/dist/**",
+    "original-supabase/**",
   ]),
 ]);
 
