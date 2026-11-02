@@ -4,15 +4,16 @@
 // Any OpenAI-compatible chat-completions gateway (AI Lodge uses apiyi). Configuration comes only from env:
 //   API_KEY             required
 //   API_BASE_URL        optional, default https://api.apiyi.com/v1
-//   MODEL_NAME          text model (weekly story), default gemini-3.5-flash-lite
-//   VISION_MODEL_NAME   vision model (moderation, captions), default MODEL_NAME
+//   MODEL_NAME          text model (weekly story), default deepseek-v4-flash (JSON mode; DeepSeek has no json_schema)
+//   VISION_MODEL_NAME   vision model (moderation, captions), default gemini-3.5-flash-lite (DeepSeek has no vision)
 // The original called Anthropic's Messages API (ANTHROPIC_* env vars); those names are read as fallbacks.
 // The original Anthropic version is kept in original-supabase/lib/ai.ts.
 import { z } from "zod";
 
 export type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
 
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "deepseek-v4-flash";
+const DEFAULT_VISION_MODEL = "gemini-3.5-flash-lite";
 
 export function aiConfig() {
   const model = process.env.MODEL_NAME?.trim() || process.env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
@@ -20,7 +21,7 @@ export function aiConfig() {
     apiKey: process.env.API_KEY?.trim() || process.env.ANTHROPIC_API_KEY?.trim() || "",
     baseURL: (process.env.API_BASE_URL?.trim() || "https://api.apiyi.com/v1").replace(/\/+$/, ""),
     model,
-    visionModel: process.env.VISION_MODEL_NAME?.trim() || model,
+    visionModel: process.env.VISION_MODEL_NAME?.trim() || DEFAULT_VISION_MODEL,
   };
 }
 
