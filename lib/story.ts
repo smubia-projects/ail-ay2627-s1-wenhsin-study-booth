@@ -1,6 +1,6 @@
 // Weekly story: the AI turns SQL-computed stats into a short, positive recap.
 import { z } from "zod";
-import { askJson, asData } from "@/lib/ai";
+import { askJson, asData } from "./ai";
 
 export const StorySchema = z.object({
   title: z.string().max(60),
@@ -19,6 +19,6 @@ export async function writeStory(stats: unknown, timeoutMs: number) {
     content: [{ type: "text", text: `Write this week's story.\n\n${asData("week_stats", JSON.stringify(stats, null, 2))}` }],
     schema: StorySchema,
     timeoutMs,
-    effort: "medium",
+    purpose: "text",
   });
 }

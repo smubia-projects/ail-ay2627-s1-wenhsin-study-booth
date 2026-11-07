@@ -1,35 +1,36 @@
-// Server-only helper for Claude calls. Every call returns JSON validated with zod;
+// Server-only helper for AI calls (used by the API in server/). Every call returns JSON validated with zod;
 // anything else (timeout, refusal, bad JSON) throws, and callers decide how to fail.
 //
-// Configuration comes only from env vars (no model names or URLs in code):
-//   ANTHROPIC_API_KEY          required
-//   ANTHROPIC_MODEL            required, e.g. the model name your provider gives you
-//   ANTHROPIC_BASE_URL         optional, for a compatible provider (e.g. https://api.apiyi.com)
-//   ANTHROPIC_FALLBACK_MODELS  optional, comma-separated. Empty = model fallback OFF.
-import Anthropic from "@anthropic-ai/sdk";
-import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
+// Any OpenAI-compatible chat-completions gateway (AI Lodge uses apiyi). Configuration comes only from env:
+//   API_KEY             required
+//   API_BASE_URL        optional, default https://api.apiyi.com/v1
+//   MODEL_NAME          text model (weekly story), default deepseek-v4-flash (JSON mode; DeepSeek has no json_schema)
+//   VISION_MODEL_NAME   vision model (moderation, captions), default gemini-3.5-flash-lite (DeepSeek has no vision)
+// The original called Anthropic's Messages API (ANTHROPIC_* env vars); those names are read as fallbacks.
+// The original Anthropic version is kept in original-supabase/lib/ai.ts.
 import { z } from "zod";
 
+export type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+
+const DEFAULT_MODEL = "deepseek-v4-flash";
+const DEFAULT_VISION_MODEL = "gemini-3.5-flash-lite";
+
 export function aiConfig() {
+  const model = process.env.MODEL_NAME?.trim() || process.env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
   return {
-    apiKey: process.env.ANTHROPIC_API_KEY?.trim() || "",
-    model: process.env.ANTHROPIC_MODEL?.trim() || "",
-    baseURL: process.env.ANTHROPIC_BASE_URL?.trim() || undefined,
-    fallbackModels: (process.env.ANTHROPIC_FALLBACK_MODELS ?? "")
-      .split(",")
-      .map((m) => m.trim())
-      .filter(Boolean),
+    apiKey: process.env.API_KEY?.trim() || process.env.ANTHROPIC_API_KEY?.trim() || "",
+    baseURL: (process.env.API_BASE_URL?.trim() || "https://api.apiyi.com/v1").replace(/\/+$/, ""),
+    model,
+    visionModel: process.env.VISION_MODEL_NAME?.trim() || DEFAULT_VISION_MODEL,
   };
 }
 
 export function aiConfigured() {
-  const c = aiConfig();
-  return Boolean(c.apiKey && c.model);
+  return Boolean(aiConfig().apiKey);
 }
 
 export function missingAiConfig() {
-  const c = aiConfig();
-  return [!c.apiKey && "ANTHROPIC_API_KEY", !c.model && "ANTHROPIC_MODEL"].filter(Boolean).join(" and ");
+  return aiConfig().apiKey ? "" : "API_KEY";
 }
 
 /** An AI failure with everything needed to debug it. */
@@ -43,147 +44,87 @@ export class AiError extends Error {
   }
 }
 
-type Effort = "low" | "medium" | "high";
-
-// Some models/providers don't support the effort setting or structured outputs.
-// After the first rejection we stop sending that feature for this server process.
-let effortSupported = true;
-let plainMode = false;
-
-export function aiMode() {
-  const parts = [plainMode ? "plain JSON (provider rejected structured outputs)" : "structured outputs"];
-  if (!effortSupported) parts.push("no effort setting (model doesn't support it)");
-  return parts.join(", ");
-}
-
 export async function askJson<T extends z.ZodType>(opts: {
   system: string;
-  content: Anthropic.Beta.BetaContentBlockParam[];
+  content: ContentPart[];
   schema: T;
   timeoutMs: number;
-  effort?: Effort;
+  /** "vision" for image inputs (VISION_MODEL_NAME), else the text model. */
+  purpose?: "text" | "vision";
   maxTokens?: number;
 }): Promise<z.infer<T>> {
   const cfg = aiConfig();
-  if (!cfg.apiKey || !cfg.model) throw new AiError(`Missing ${missingAiConfig()}`, { config: "missing" });
-  const client = new Anthropic({ apiKey: cfg.apiKey, baseURL: cfg.baseURL, maxRetries: 0, timeout: opts.timeoutMs });
-  const signal = AbortSignal.timeout(opts.timeoutMs);
-  const maxTokens = opts.maxTokens ?? 4000;
-
-  while (!plainMode) {
-    const structured = {
-      model: cfg.model,
-      max_tokens: maxTokens,
-      system: opts.system,
-      messages: [{ role: "user" as const, content: opts.content }],
-      output_config: {
-        ...(effortSupported ? { effort: opts.effort ?? "low" } : {}),
-        format: betaZodOutputFormat(opts.schema),
-      },
-    };
-    try {
-      const response = cfg.fallbackModels.length
-        ? // Fallback only to the models you listed (never Anthropic's "default" routing).
-          await client.beta.messages
-            .parse(
-              {
-                ...structured,
-                betas: ["server-side-fallback-2026-06-01"],
-                fallbacks: cfg.fallbackModels.map((model) => ({ model })),
-              },
-              { signal },
-            )
-            .catch(async (e) => {
-              if (!isUnsupported(e, /fallback|beta/i)) throw e;
-              console.warn("[ai] provider rejected model fallback; continuing with fallback OFF");
-              return client.beta.messages.parse(structured, { signal });
-            })
-        : await client.beta.messages.parse(structured, { signal });
-      checkStop(response.stop_reason, "structured");
-      return opts.schema.parse(response.parsed_output);
-    } catch (e) {
-      if (effortSupported && isUnsupported(e, /effort/i)) {
-        console.warn("[ai] model doesn't support the effort setting; retrying without it", errorDetail(e));
-        effortSupported = false;
-        continue;
-      }
-      if (!isUnsupported(e)) throw wrap(e, "structured");
-      console.warn("[ai] provider rejected structured outputs; switching to plain JSON requests", errorDetail(e));
-      plainMode = true;
-    }
-  }
-
-  // Plain request: ask for JSON matching the schema, then validate it ourselves.
+  if (!cfg.apiKey) throw new AiError(`Missing ${missingAiConfig()}`, { config: "missing" });
+  const model = opts.purpose === "vision" ? cfg.visionModel : cfg.model;
   const jsonSchema = JSON.stringify(z.toJSONSchema(opts.schema));
+  let res: Response;
   try {
-    const response = await client.messages.create(
-      {
-        model: cfg.model,
-        max_tokens: maxTokens,
-        system: `${opts.system}\n\nRespond with ONLY a JSON object (no prose, no code fences) matching this JSON Schema:\n${jsonSchema}`,
-        messages: [{ role: "user", content: opts.content as Anthropic.ContentBlockParam[] }],
-      },
-      { signal },
-    );
-    checkStop(response.stop_reason, "plain");
-    const text = response.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start < 0 || end < start) throw new AiError("the AI's answer had no JSON", { attempt: "plain", text: text.slice(0, 500) });
+    res = await fetch(`${cfg.baseURL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify({
+        model,
+        max_tokens: opts.maxTokens ?? 2000,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: `${opts.system}\n\nRespond with ONLY a JSON object (no prose, no code fences) matching this JSON Schema:\n${jsonSchema}`,
+          },
+          { role: "user", content: opts.content },
+        ],
+      }),
+      signal: AbortSignal.timeout(opts.timeoutMs),
+    });
+  } catch (e) {
+    throw wrap(e);
+  }
+  const body = (await res.json().catch(() => null)) as {
+    choices?: { message?: { content?: string | null; refusal?: string | null }; finish_reason?: string }[];
+    error?: { message?: string };
+  } | null;
+  if (!res.ok) {
+    throw new AiError(describeStatus(res.status, model, body?.error?.message), { status: res.status, error: body?.error });
+  }
+  const choice = body?.choices?.[0];
+  if (choice?.message?.refusal) throw new AiError("model refused", { finish_reason: choice.finish_reason });
+  if (choice?.finish_reason === "length") throw new AiError("output truncated", { finish_reason: "length" });
+  const text = choice?.message?.content ?? "";
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end < start) throw new AiError("the AI's answer had no JSON", { text: text.slice(0, 500) });
+  try {
     return opts.schema.parse(JSON.parse(text.slice(start, end + 1)));
   } catch (e) {
-    throw wrap(e, "plain");
+    throw wrap(e);
   }
 }
 
-/**
- * True when the provider says a request feature isn't supported. Judged by the
- * error message on any 4xx, because some proxies report it with odd status codes
- * (apiyi sends 429 for "This model does not support the effort parameter").
- */
-function isUnsupported(e: unknown, feature = /output_config|output_format|format|effort|structured|json_schema|beta|fallback/i) {
-  if (!(e instanceof Anthropic.APIError) || !e.status || e.status < 400 || e.status >= 500) return false;
-  const text = `${e.message} ${JSON.stringify(e.error ?? "")}`;
-  const saysUnsupported = /not support|unsupported|extra inputs|not permitted|unknown (parameter|field)|unrecognized|invalid (parameter|field)/i;
-  return saysUnsupported.test(text) && feature.test(text);
-}
-
-function checkStop(stop: string | null, attempt: string) {
-  if (stop === "refusal") throw new AiError("model refused", { attempt, stop_reason: stop });
-  if (stop === "max_tokens") throw new AiError("output truncated", { attempt, stop_reason: stop });
+function describeStatus(status: number, model: string, message = "") {
+  if (status === 401) return "the AI key (API_KEY) was rejected";
+  if (status === 403) return `this AI key isn't allowed to use "${model}"`;
+  if (status === 404) return `"${model}" wasn't found at this AI provider (check the model name and API_BASE_URL)`;
+  if (status === 429) return `the AI provider returned 429: ${message.slice(0, 200)}`;
+  if (status === 400) return `the AI request was rejected: ${message.slice(0, 200)}`;
+  return `AI service error ${status}: ${message.slice(0, 200)}`.trim();
 }
 
 function errorDetail(e: unknown): Record<string, unknown> {
   if (e instanceof AiError) return e.detail;
-  if (e instanceof Anthropic.APIError) {
-    return {
-      status: e.status,
-      message: e.message,
-      error: e.error,
-      request_id: e.requestID ?? undefined,
-    };
-  }
   if (e instanceof z.ZodError) return { zod: e.issues };
   if (e instanceof Error) return { name: e.name, message: e.message };
   return { error: String(e) };
 }
 
-function wrap(e: unknown, attempt: string) {
+function wrap(e: unknown) {
   if (e instanceof AiError) return e;
-  return new AiError(describeAiError(e), { attempt, ...errorDetail(e) });
+  return new AiError(describeAiError(e), errorDetail(e));
 }
 
-/** Image content block from a data URL or raw base64 JPEG/PNG. */
-export function imageBlock(data: string, mediaType: "image/jpeg" | "image/png" = "image/jpeg"): Anthropic.Beta.BetaImageBlockParam {
-  const match = /^data:(image\/(?:jpeg|png));base64,(.+)$/.exec(data);
-  return {
-    type: "image",
-    source: {
-      type: "base64",
-      media_type: (match?.[1] as "image/jpeg" | "image/png") ?? mediaType,
-      data: match ? match[2] : data,
-    },
-  };
+/** Image content part from a data URL or raw base64 JPEG/PNG. */
+export function imageBlock(data: string, mediaType: "image/jpeg" | "image/png" = "image/jpeg"): ContentPart {
+  const url = /^data:image\/(?:jpeg|png);base64,/.test(data) ? data : `data:${mediaType};base64,${data}`;
+  return { type: "image_url", image_url: { url } };
 }
 
 /** Wraps user-provided text so the model treats it as data, never as instructions. */
@@ -195,28 +136,16 @@ export function asData(tag: string, text: string) {
 
 /** Short, human-readable reason for an AI failure (shown to the sender and logged). */
 export function describeAiError(e: unknown): string {
-  const model = aiConfig().model;
   if (e instanceof AiError) return e.message;
-  if (e instanceof Anthropic.AuthenticationError) return "the AI key (ANTHROPIC_API_KEY) was rejected";
-  if (e instanceof Anthropic.PermissionDeniedError) return `this AI key isn't allowed to use "${model}"`;
-  if (e instanceof Anthropic.NotFoundError) return `"${model}" wasn't found at this AI provider (check ANTHROPIC_MODEL and ANTHROPIC_BASE_URL)`;
-  if (e instanceof Anthropic.RateLimitError) return `the AI provider returned 429: ${providerMessage(e)}`;
-  if (e instanceof Anthropic.BadRequestError) return `the AI request was rejected: ${e.message.slice(0, 200)}`;
-  if (e instanceof Anthropic.APIUserAbortError || e instanceof Anthropic.APIConnectionTimeoutError) return "the AI took too long";
-  if (e instanceof Anthropic.APIConnectionError) return "couldn't reach the AI service (check ANTHROPIC_BASE_URL)";
-  if (e instanceof Anthropic.APIError) return `AI service error ${e.status ?? ""}: ${providerMessage(e)}`.trim();
+  if (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError")) return "the AI took too long";
+  if (e instanceof TypeError) return "couldn't reach the AI service (check API_BASE_URL)";
   if (e instanceof z.ZodError) return "the AI's answer wasn't in the expected format";
+  if (e instanceof SyntaxError) return "the AI's answer wasn't valid JSON";
   if (e instanceof Error) return e.message.slice(0, 200);
   return "unknown error";
 }
 
-/** The provider's own error message, if it sent one. */
-function providerMessage(e: InstanceType<typeof Anthropic.APIError>) {
-  const body = e.error as { error?: { message?: string }; message?: string } | undefined;
-  return (body?.error?.message ?? body?.message ?? e.message).slice(0, 200);
-}
-
-/** Full error details for logs and the AI check endpoint. */
+/** Full error details for logs. */
 export function fullAiError(e: unknown) {
   return { reason: describeAiError(e), ...errorDetail(e) };
 }

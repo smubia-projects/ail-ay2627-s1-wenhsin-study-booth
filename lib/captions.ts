@@ -1,6 +1,6 @@
 // Caption suggestions: friendly, short, never about bodies, looks, rooms or productivity.
 import { z } from "zod";
-import { askJson, asData, imageBlock } from "@/lib/ai";
+import { askJson, asData, imageBlock } from "./ai";
 
 export const CaptionSchema = z.object({
   suggestions: z.array(z.string().min(1).max(80)).min(1).max(3),
@@ -33,7 +33,7 @@ export async function suggestCaptions(input: {
     content: [imageBlock(input.imageBase64), { type: "text", text: `Suggest 3 captions.\n\n${context}` }],
     schema: CaptionSchema,
     timeoutMs: input.timeoutMs,
-    effort: "low",
+    purpose: "vision",
   });
   return result.suggestions.map((s) => s.trim()).filter(Boolean).slice(0, 3);
 }
