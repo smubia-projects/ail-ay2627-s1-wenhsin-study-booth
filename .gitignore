@@ -43,3 +43,6 @@ next-env.d.ts
 
 # copied from node_modules by scripts/copy-mediapipe.mjs
 /public/mediapipe
+
+# AI Lodge deploy: the API bundle
+/server/dist
