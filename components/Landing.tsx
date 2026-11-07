@@ -1,14 +1,13 @@
 // The signed-out landing page: "Study Booth" lights up bulb by bulb on a
-// marquee board, then the tagline, a few feature chips and the sign-in card float in.
+// marquee board, then the tagline, a few feature chips and the entry card float in.
 // The title is a canvas (MarqueeTitle); the rest is CSS (see "landing" in
 // globals.css). Both switch off with prefers-reduced-motion.
 
-import AuthCard from "@/components/AuthCard";
 import MarqueeTitle from "@/components/MarqueeTitle";
 
 const FEATURES = ["Fog-glass doodles", "Handwritten card notes", "Scratch to reveal", "Floating study widget"];
 
-export default function Landing({ notice }: { notice?: React.ReactNode }) {
+export default function Landing({ notice }: { notice: React.ReactNode }) {
   return (
     <main className="landing">
       <div className="landing-bubbles" aria-hidden="true">
@@ -34,7 +33,7 @@ export default function Landing({ notice }: { notice?: React.ReactNode }) {
         ))}
       </ul>
 
-      <div className="landing-auth">{notice ?? <AuthCard />}</div>
+      <div className="landing-auth">{notice}</div>
     </main>
   );
 }

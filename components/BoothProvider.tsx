@@ -1,12 +1,14 @@
 "use client";
 
-// Everything the booth needs from Supabase: your profile and group, the last
-// 24 hours of posts (live via Realtime), reveals, reports, check-ins and the
-// study session. Shared by the main desktop and the pop-out widget.
+// Everything the booth needs, kept in this browser (AI Lodge showcase: no accounts, no database).
+// Your own posts, reveals, reports and study sessions live in localStorage. The group is a seeded demo
+// group of three friends whose posts ship with the app, so the feed, stories and scratch-to-reveal work
+// for a single visitor. Each post you send goes to the API for AI moderation (image in the request body);
+// only an approved post shows as shared. Shared by the main desktop and the pop-out widget.
+// The original Supabase version (auth, groups, Realtime, private storage) is in original-supabase/.
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { createClient } from "@/utils/supabase/client";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { api, LimitError } from "@/lib/api";
 
 export type Profile = { id: string; display_name: string };
 export type Group = { id: string; name: string; invite_code: string };
@@ -30,18 +32,37 @@ export type Post = {
 };
 export type Checkin = { id: string; group_id: string; message: string; created_at: string };
 export type StudySession = { id: string; startedAt: number; endsAt: number; focus: boolean };
+export type StudyLogEntry = { startedAt: number; endedAt: number };
 export type SendResult = { status: "approved" | "held"; message: string };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const NOTE_MS = 3 * 60 * 60 * 1000; // check-in sticky notes stay up for 3 hours
-const MAX_POSTS = 30;
-const SIGNED_URL_SECONDS = 60 * 60;
-const HEARTBEAT_MS = 5 * 60 * 1000;
-const GROUP_KEY = "studybooth.groupId";
-const SESSION_KEY = "studybooth.session";
+const MAX_OWN_POSTS = 12;
+const ME_ID = "me";
+const KEYS = {
+  name: "studybooth.name",
+  posts: "studybooth.posts",
+  image: (id: string) => `studybooth.img.${id}`,
+  revealed: "studybooth.revealed",
+  reported: "studybooth.reported",
+  session: "studybooth.session",
+  log: "studybooth.studyLog",
+};
+
+export const DEMO_GROUP: Group = { id: "demo-group", name: "Study Buddies", invite_code: "DEMO42" };
+export const FRIENDS: Profile[] = [
+  { id: "friend-mei", display_name: "Mei" },
+  { id: "friend-arjun", display_name: "Arjun" },
+  { id: "friend-zoe", display_name: "Zoe" },
+];
+// Seeded friends' fog posts (images in public/demo), placed a few hours back so they sit in the 24-hour feed.
+const SEED: { id: string; user: string; file: string; caption: string; minutesAgo: number }[] = [
+  { id: "seed-1", user: "friend-mei", file: "friend-08.jpg", caption: "anyone else need snacks rn", minutesAgo: 25 },
+  { id: "seed-2", user: "friend-zoe", file: "friend-06.jpg", caption: "group project crunch time", minutesAgo: 95 },
+  { id: "seed-3", user: "friend-arjun", file: "friend-04.jpg", caption: "library till it closes", minutesAgo: 210 },
+  { id: "seed-4", user: "friend-mei", file: "friend-03.jpg", caption: "for whoever has chem tomorrow", minutesAgo: 420 },
+];
 
 type BoothState = {
-  supabase: SupabaseClient;
   me: Profile | null;
   groups: Group[];
   group: Group | null;
@@ -52,15 +73,13 @@ type BoothState = {
   reported: Set<string>;
   checkins: Checkin[];
   session: StudySession | null;
+  studyLog: StudyLogEntry[];
   loading: boolean;
   error: string;
   nameOf: (userId: string) => string;
   selectGroup: (id: string) => void;
-  createGroup: (name: string) => Promise<void>;
-  joinGroup: (code: string) => Promise<void>;
-  leaveGroup: () => Promise<void>;
   renameMe: (name: string) => Promise<void>;
-  /** Sends to `groupId`, or to the group you are looking at. */
+  /** Sends to the demo group. */
   sendPost: (p: { image: string; kind: PostKind; caption?: string; noteText?: string; groupId?: string }) => Promise<SendResult>;
   deletePost: (post: Post) => Promise<void>;
   reveal: (postId: string) => Promise<void>;
@@ -69,6 +88,8 @@ type BoothState = {
   stopStudy: () => Promise<void>;
   setFocus: (focus: boolean) => void;
   refresh: () => Promise<void>;
+  /** Clears everything this browser saved for the demo. */
+  resetDemo: () => void;
 };
 
 const BoothContext = createContext<BoothState | null>(null);
@@ -79,303 +100,231 @@ export function useBooth() {
   return ctx;
 }
 
-function errorText(e: unknown) {
-  if (e && typeof e === "object" && "message" in e) return String((e as { message: unknown }).message);
-  return "Something went wrong.";
+// ---- localStorage helpers (storage can be full, blocked or empty; never let that break the app)
+function read<T>(key: string, fallback: T): T {
+  try {
+    const v = window.localStorage.getItem(key);
+    return v === null ? fallback : (JSON.parse(v) as T);
+  } catch {
+    return fallback;
+  }
+}
+function write(key: string, value: unknown) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+function remove(key: string) {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {}
 }
 
-export function BoothProvider({ userId, children }: { userId: string; children: React.ReactNode }) {
-  const supabase = useMemo(() => createClient(), []);
-  const [me, setMe] = useState<Profile | null>(null);
-  const [groups, setGroups] = useState<Group[]>([]);
-  const [groupId, setGroupId] = useState<string | null>(null);
-  const [members, setMembers] = useState<Profile[]>([]);
-  const [posts, setPosts] = useState<Post[]>([]);
-  const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
+function seedPosts(now: number): Post[] {
+  return SEED.map((s) => ({
+    id: s.id,
+    group_id: DEMO_GROUP.id,
+    user_id: s.user,
+    kind: "fog",
+    image_path: `/demo/${s.file}`,
+    caption: s.caption,
+    note_text: null,
+    status: "approved",
+    moderation_reason: null,
+    created_at: new Date(now - s.minutesAgo * 60_000).toISOString(),
+  }));
+}
+
+export function BoothProvider({ children }: { children: React.ReactNode }) {
+  const [name, setName] = useState("You");
+  const [ownPosts, setOwnPosts] = useState<Post[]>([]);
+  const [ownImages, setOwnImages] = useState<Record<string, string>>({});
+  const [seeded, setSeeded] = useState<Post[]>([]);
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
   const [reported, setReported] = useState<Set<string>>(new Set());
-  const [checkins, setCheckins] = useState<Checkin[]>([]);
-  // Study session, restored after a reload while its timer is still running.
-  const [session, setSession] = useState<StudySession | null>(() => {
-    if (typeof window === "undefined") return null;
-    try {
-      const saved = JSON.parse(window.localStorage.getItem(SESSION_KEY) ?? "null") as StudySession | null;
-      return saved && saved.endsAt > Date.now() ? saved : null;
-    } catch {
-      return null;
-    }
-  });
+  const [session, setSession] = useState<StudySession | null>(null);
+  const [studyLog, setStudyLog] = useState<StudyLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const urlCache = useRef<Record<string, string>>({});
 
-  const group = groups.find((g) => g.id === groupId) ?? null;
-
-  // ---- profile and groups
-  const loadGroups = useCallback(async () => {
-    const [{ data: profile }, { data: rows, error: gErr }] = await Promise.all([
-      supabase.from("profiles").select("id, display_name").eq("id", userId).maybeSingle(),
-      supabase.from("group_members").select("groups(id, name, invite_code)").eq("user_id", userId),
-    ]);
-    if (gErr) {
-      setError(
-        gErr.code === "42P01" || gErr.message.includes("does not exist")
-          ? "The database isn't set up yet. Run supabase/migrations/0001_init.sql in the Supabase SQL editor."
-          : gErr.message,
-      );
-      setLoading(false);
-      return;
+  const load = useCallback(async () => {
+    const now = Date.now();
+    const mine = read<Post[]>(KEYS.posts, []).filter((p) => now - new Date(p.created_at).getTime() < DAY_MS);
+    const images: Record<string, string> = {};
+    for (const p of mine) {
+      const img = read<string | null>(KEYS.image(p.id), null);
+      if (img) images[p.image_path] = img;
     }
-    setMe(profile ?? { id: userId, display_name: "you" });
-    const list = (rows ?? []).flatMap((r) => (r.groups ? [r.groups as unknown as Group] : []));
-    setGroups(list);
-    setGroupId((current) => {
-      if (current && list.some((g) => g.id === current)) return current;
-      let saved: string | null = null;
-      try {
-        saved = window.localStorage.getItem(GROUP_KEY);
-      } catch {}
-      return list.find((g) => g.id === saved)?.id ?? list[0]?.id ?? null;
-    });
+    setOwnPosts(mine);
+    setOwnImages(images);
+    setSeeded(seedPosts(now));
+    setName(read(KEYS.name, "You"));
+    setRevealed(new Set(read<string[]>(KEYS.revealed, [])));
+    setReported(new Set(read<string[]>(KEYS.reported, [])));
+    const saved = read<StudySession | null>(KEYS.session, null);
+    setSession(saved && saved.endsAt > now ? saved : null);
+    setStudyLog(read<StudyLogEntry[]>(KEYS.log, []).filter((s) => now - s.startedAt < 8 * DAY_MS));
     setLoading(false);
-  }, [supabase, userId]);
+  }, []);
 
   useEffect(() => {
-    // Fetching from Supabase on mount; state is set after the request resolves.
+    // Reads localStorage after mount (the server render has no storage).
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void loadGroups();
-  }, [loadGroups]);
-
-  // ---- posts, members, reveals, reports, check-ins for the current group
-  const loadGroupData = useCallback(async () => {
-    if (!groupId) return;
-    const since = new Date(Date.now() - DAY_MS).toISOString();
-    const notesSince = new Date(Date.now() - NOTE_MS).toISOString();
-    const [postsRes, membersRes, checkinsRes, reportsRes] = await Promise.all([
-      supabase
-        .from("posts")
-        .select("*")
-        .eq("group_id", groupId)
-        .gte("created_at", since)
-        .order("created_at", { ascending: false })
-        .limit(MAX_POSTS),
-      supabase.from("group_members").select("user_id").eq("group_id", groupId),
-      supabase
-        .from("checkins")
-        .select("*")
-        .eq("group_id", groupId)
-        .gte("created_at", notesSince)
-        .order("created_at", { ascending: false })
-        .limit(3),
-      supabase.from("reports").select("post_id").eq("reporter_id", userId),
-    ]);
-    const list = (postsRes.data ?? []) as Post[];
-    setPosts(list);
-    setCheckins((checkinsRes.data ?? []) as Checkin[]);
-    setReported(new Set((reportsRes.data ?? []).map((r) => r.post_id as string)));
-
-    const memberIds = (membersRes.data ?? []).map((m) => m.user_id as string);
-    if (memberIds.length) {
-      const { data: profiles } = await supabase.from("profiles").select("id, display_name").in("id", memberIds);
-      setMembers((profiles ?? []) as Profile[]);
-    }
-
-    if (list.length) {
-      const { data: reveals } = await supabase
-        .from("post_reveals")
-        .select("post_id")
-        .eq("user_id", userId)
-        .in(
-          "post_id",
-          list.map((p) => p.id),
-        );
-      setRevealed(new Set((reveals ?? []).map((r) => r.post_id as string)));
-
-      // Short-lived signed URLs for the private bucket; reuse ones we already have.
-      const missing = list.map((p) => p.image_path).filter((path) => !urlCache.current[path]);
-      if (missing.length) {
-        const { data: signed } = await supabase.storage.from("posts").createSignedUrls(missing, SIGNED_URL_SECONDS);
-        for (const s of signed ?? []) if (s.path && s.signedUrl) urlCache.current[s.path] = s.signedUrl;
-        setImageUrls({ ...urlCache.current });
-      }
-    }
-  }, [supabase, groupId, userId]);
-
-  useEffect(() => {
-    if (!groupId) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetch, state set after it resolves
-    void loadGroupData();
-    // Live updates; a slow poll covers the case where Realtime isn't enabled.
-    const channel = supabase
-      .channel(`group-${groupId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "posts", filter: `group_id=eq.${groupId}` }, () => {
-        void loadGroupData();
-      })
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "checkins", filter: `group_id=eq.${groupId}` },
-        (payload) => setCheckins((c) => [payload.new as Checkin, ...c].slice(0, 3)),
-      )
-      .subscribe();
-    const poll = window.setInterval(() => void loadGroupData(), 60_000);
-    return () => {
-      window.clearInterval(poll);
-      void supabase.removeChannel(channel);
+    void load();
+    // The pop-out widget and other tabs share this storage; pick up their changes.
+    const onStorage = (e: StorageEvent) => {
+      if (e.key?.startsWith("studybooth.")) void load();
     };
-  }, [supabase, groupId, loadGroupData]);
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [load]);
+
+  const saveOwn = useCallback((list: Post[]) => {
+    const kept = list.slice(0, MAX_OWN_POSTS);
+    for (const p of list.slice(MAX_OWN_POSTS)) remove(KEYS.image(p.id));
+    setOwnPosts(kept);
+    write(KEYS.posts, kept);
+  }, []);
+
+  const updatePost = useCallback((id: string, patch: Partial<Post>) => {
+    setOwnPosts((list) => {
+      const next = list.map((p) => (p.id === id ? { ...p, ...patch } : p));
+      write(KEYS.posts, next);
+      return next;
+    });
+  }, []);
 
   const saveSession = (s: StudySession | null) => {
     setSession(s);
-    try {
-      if (s) window.localStorage.setItem(SESSION_KEY, JSON.stringify(s));
-      else window.localStorage.removeItem(SESSION_KEY);
-    } catch {}
+    if (s) write(KEYS.session, s);
+    else remove(KEYS.session);
   };
 
   const stopStudy = useCallback(async () => {
-    const current = session;
+    if (!session) return;
+    const entry = { startedAt: session.startedAt, endedAt: Math.min(Date.now(), session.endsAt) };
+    const log = [...read<StudyLogEntry[]>(KEYS.log, []), entry].slice(-100);
+    write(KEYS.log, log);
+    setStudyLog(log);
     saveSession(null);
-    if (current) await supabase.from("study_sessions").update({ ended_at: new Date().toISOString() }).eq("id", current.id);
-  }, [session, supabase]);
+  }, [session]);
 
-  // End the session when the timer runs out, heartbeat while it runs, and
-  // close it if the tab is closed.
+  // End the session when the timer runs out.
   useEffect(() => {
     if (!session) return;
-    const left = session.endsAt - Date.now();
-    const end = window.setTimeout(() => void stopStudy(), Math.max(0, left));
-    const beat = window.setInterval(() => {
-      void supabase.from("study_sessions").update({ last_seen_at: new Date().toISOString() }).eq("id", session.id);
-    }, HEARTBEAT_MS);
-    const onHide = () => {
-      navigator.sendBeacon?.("/api/session/end", JSON.stringify({ sessionId: session.id }));
-    };
-    window.addEventListener("pagehide", onHide);
-    return () => {
-      window.clearTimeout(end);
-      window.clearInterval(beat);
-      window.removeEventListener("pagehide", onHide);
-    };
-  }, [session, stopStudy, supabase]);
+    const end = window.setTimeout(() => void stopStudy(), Math.max(0, session.endsAt - Date.now()));
+    return () => window.clearTimeout(end);
+  }, [session, stopStudy]);
 
-  // ---- actions
+  const posts = useMemo(
+    () => [...ownPosts, ...seeded].sort((a, b) => b.created_at.localeCompare(a.created_at)),
+    [ownPosts, seeded],
+  );
+  const imageUrls = useMemo(() => {
+    const urls: Record<string, string> = { ...ownImages };
+    for (const p of seeded) urls[p.image_path] = p.image_path;
+    return urls;
+  }, [ownImages, seeded]);
+  const me: Profile = { id: ME_ID, display_name: name };
+
   const value: BoothState = {
-    supabase,
     me,
-    groups,
-    group,
-    members,
+    groups: [DEMO_GROUP],
+    group: DEMO_GROUP,
+    members: [me, ...FRIENDS],
     posts,
     imageUrls,
     revealed,
     reported,
-    checkins,
+    checkins: [],
     session,
+    studyLog,
     loading,
-    error,
-    nameOf: (id) => (id === userId ? "You" : (members.find((m) => m.id === id)?.display_name ?? "A friend")),
-    selectGroup: (id) => {
-      setGroupId(id);
-      try {
-        window.localStorage.setItem(GROUP_KEY, id);
-      } catch {}
-    },
-    createGroup: async (name) => {
-      const { data, error: e } = await supabase.rpc("create_group", { p_name: name });
-      if (e) throw new Error(errorText(e));
-      await loadGroups();
-      value.selectGroup((data as Group).id);
-    },
-    joinGroup: async (code) => {
-      const { data, error: e } = await supabase.rpc("join_group", { p_code: code });
-      if (e) throw new Error(errorText(e).includes("invite code") ? "No group with that invite code." : errorText(e));
-      await loadGroups();
-      value.selectGroup((data as Group).id);
-    },
-    leaveGroup: async () => {
-      if (!groupId) return;
-      await supabase.from("group_members").delete().eq("group_id", groupId).eq("user_id", userId);
-      setGroupId(null);
-      setPosts([]);
-      await loadGroups();
-    },
-    renameMe: async (name) => {
-      const clean = name.trim().slice(0, 30);
+    error: "",
+    nameOf: (id) => (id === ME_ID ? "You" : (FRIENDS.find((m) => m.id === id)?.display_name ?? "A friend")),
+    selectGroup: () => {},
+    renameMe: async (n) => {
+      const clean = n.trim().slice(0, 30);
       if (!clean) return;
-      const { error: e } = await supabase.from("profiles").update({ display_name: clean }).eq("id", userId);
-      if (e) throw new Error(errorText(e));
-      setMe((m) => (m ? { ...m, display_name: clean } : m));
-      setMembers((list) => list.map((m) => (m.id === userId ? { ...m, display_name: clean } : m)));
+      write(KEYS.name, clean);
+      setName(clean);
     },
-    sendPost: async ({ image, kind, caption, noteText, groupId: to }) => {
-      const target = to ?? groupId;
-      if (!target || !groups.some((g) => g.id === target)) throw new Error("Join or create a group first.");
+    sendPost: async ({ image, kind, caption, noteText }) => {
       const id = crypto.randomUUID();
-      const path = `${target}/${userId}/${id}.jpg`;
-      const blob = await (await fetch(image)).blob();
-      const up = await supabase.storage.from("posts").upload(path, blob, { contentType: "image/jpeg" });
-      if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
-      const ins = await supabase.from("posts").insert({
+      const path = `local:${id}`;
+      if (!write(KEYS.image(id), image)) {
+        // Storage full: drop the oldest of your posts' images and try once more.
+        const oldest = ownPosts[ownPosts.length - 1];
+        if (oldest) remove(KEYS.image(oldest.id));
+        if (!write(KEYS.image(id), image)) throw new Error("This browser's storage is full. Delete an old post and try again.");
+      }
+      const post: Post = {
         id,
-        group_id: target,
-        user_id: userId,
+        group_id: DEMO_GROUP.id,
+        user_id: ME_ID,
         kind,
         image_path: path,
         caption: caption?.trim() || null,
         note_text: noteText?.trim() || null,
-      });
-      if (ins.error) {
-        await supabase.storage.from("posts").remove([path]);
-        throw new Error(`Couldn't save the post: ${ins.error.message}`);
-      }
+        status: "pending",
+        moderation_reason: null,
+        created_at: new Date().toISOString(),
+      };
+      setOwnImages((m) => ({ ...m, [path]: image }));
       // Show the post to its author straight away (as "Checking…") while moderation runs.
-      void loadGroupData();
-      // Moderation decides whether friends ever see it. Any failure leaves it held.
+      saveOwn([post, ...ownPosts]);
+
+      // Moderation decides whether the post counts as shared. Any failure leaves it held (fails closed).
+      const typedText = [post.note_text && `Note: ${post.note_text}`, post.caption && `Caption: ${post.caption}`]
+        .filter(Boolean)
+        .join("\n");
       let result: SendResult = {
         status: "held",
         message: "We couldn't check your post right now, so it wasn't shared. Try again in a minute.",
       };
       try {
-        const res = await fetch("/api/moderate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ postId: id }),
-          signal: AbortSignal.timeout(25_000),
-        });
-        const body = (await res.json()) as { status?: string; message?: string };
-        if (res.ok && body.status === "approved") result = { status: "approved", message: "Sent!" };
-        else if (body.message) result = { status: "held", message: body.message };
-      } catch {}
-      await loadGroupData();
+        const res = await api<{ status?: string; message?: string }>("/api/moderate", { image, text: typedText });
+        result = res.status === "approved" ? { status: "approved", message: "Sent!" } : { status: "held", message: res.message || result.message };
+      } catch (e) {
+        if (e instanceof LimitError) result = { status: "held", message: `${e.message} Your post wasn't checked, so it wasn't shared.` };
+        else if (e instanceof Error && e.message) result = { status: "held", message: e.message };
+      }
+      updatePost(id, { status: result.status, moderation_reason: result.status === "held" ? result.message : null });
       return result;
     },
     deletePost: async (post) => {
-      await supabase.from("posts").delete().eq("id", post.id).eq("user_id", userId);
-      await supabase.storage.from("posts").remove([post.image_path]);
-      setPosts((list) => list.filter((p) => p.id !== post.id));
+      remove(KEYS.image(post.id));
+      saveOwn(ownPosts.filter((p) => p.id !== post.id));
     },
     reveal: async (postId) => {
-      setRevealed((s) => new Set(s).add(postId));
-      await supabase.from("post_reveals").insert({ post_id: postId, user_id: userId });
+      setRevealed((s) => {
+        const next = new Set(s).add(postId);
+        write(KEYS.revealed, [...next]);
+        return next;
+      });
     },
-    report: async (postId, reason) => {
-      setReported((s) => new Set(s).add(postId));
-      await supabase.from("reports").insert({ post_id: postId, reporter_id: userId, reason: reason.slice(0, 300) });
+    report: async (postId) => {
+      setReported((s) => {
+        const next = new Set(s).add(postId);
+        write(KEYS.reported, [...next]);
+        return next;
+      });
     },
     startStudy: async (minutes, focus) => {
-      if (!groupId) throw new Error("Join or create a group first.");
-      const { data, error: e } = await supabase
-        .from("study_sessions")
-        .insert({ user_id: userId, group_id: groupId })
-        .select("id, started_at")
-        .single();
-      if (e) throw new Error(errorText(e));
-      const startedAt = new Date(data.started_at as string).getTime();
-      saveSession({ id: data.id as string, startedAt, endsAt: startedAt + minutes * 60_000, focus });
+      const startedAt = Date.now();
+      saveSession({ id: crypto.randomUUID(), startedAt, endsAt: startedAt + minutes * 60_000, focus });
     },
     stopStudy,
     setFocus: (focus) => session && saveSession({ ...session, focus }),
-    refresh: loadGroupData,
+    refresh: load,
+    resetDemo: () => {
+      try {
+        for (const k of Object.keys(window.localStorage)) if (k.startsWith("studybooth.")) window.localStorage.removeItem(k);
+      } catch {}
+      void load();
+    },
   };
 
   return <BoothContext.Provider value={value}>{children}</BoothContext.Provider>;

@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import FogBooth from "@/components/FogBooth";
 import CardComposer from "@/components/CardComposer";
 import { useBooth, type PostKind } from "@/components/BoothProvider";
+import { api, LimitError } from "@/lib/api";
 
 type Style = "photo" | "fog" | "card";
 type Draft = { image: string; kind: PostKind; noteText?: string };
@@ -39,6 +40,10 @@ export default function NewPost({ onShared }: { onShared: (ok: boolean, message:
               <span>{s.blurb}</span>
             </button>
           ))}
+          <p className="hint">
+            📷 When you send a post (or ask for caption ideas), the finished image is sent to an AI model to check it and
+            read any writing. The live camera, mic and hand tracking stay on your device.
+          </p>
         </div>
       ) : (
         <>
@@ -103,37 +108,40 @@ function SendPreview({
   /** Nothing was saved; stay here so they can try again. */
   onError: (message: string) => void;
 }) {
-  const { group, groups, sendPost } = useBooth();
+  const { group, groups, sendPost, posts, session } = useBooth();
   const [to, setTo] = useState(group?.id ?? "");
   const target = groups.find((g) => g.id === to) ?? group;
   const [caption, setCaption] = useState("");
   const [suggestions, setSuggestions] = useState<string[] | null>(null);
   const [sending, setSending] = useState(false);
 
-  // Ask for caption ideas in the background. Slow or failed = no chips, nothing else changes.
-  useEffect(() => {
-    if (!group) return;
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 7000);
-    fetch("/api/caption", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        image: draft.image,
-        groupId: group.id,
-        localTime: new Date().toLocaleString([], { weekday: "long", hour: "numeric", minute: "2-digit" }),
-      }),
-      signal: controller.signal,
-    })
-      .then((r) => r.json())
-      .then((d: { suggestions?: string[] }) => setSuggestions(Array.isArray(d.suggestions) ? d.suggestions : []))
-      .catch(() => setSuggestions([]))
-      .finally(() => window.clearTimeout(timer));
-    return () => {
-      window.clearTimeout(timer);
-      controller.abort();
-    };
-  }, [draft.image, group]);
+  const [thinking, setThinking] = useState(false);
+  const [captionNote, setCaptionNote] = useState("");
+
+  // Caption ideas only when asked (each one is an AI call). Slow or failed = no chips; posting still works.
+  async function suggest() {
+    setThinking(true);
+    setCaptionNote("");
+    try {
+      const recentCaptions = posts.filter((p) => p.status === "approved" && p.caption).slice(0, 3).map((p) => p.caption);
+      const d = await api<{ suggestions?: string[] }>(
+        "/api/caption",
+        {
+          image: draft.image,
+          localTime: new Date().toLocaleString([], { weekday: "long", hour: "numeric", minute: "2-digit" }),
+          minutesStudied: session ? Math.round((Date.now() - session.startedAt) / 60_000) : null,
+          recentCaptions,
+        },
+        12_000,
+      );
+      setSuggestions(Array.isArray(d.suggestions) ? d.suggestions : []);
+    } catch (e) {
+      setSuggestions([]);
+      setCaptionNote(e instanceof LimitError ? e.message : "No caption ideas right now. Write your own, or try again.");
+    } finally {
+      setThinking(false);
+    }
+  }
 
   async function send() {
     if (!target) return;
@@ -167,7 +175,12 @@ function SendPreview({
         <input id="caption" type="text" maxLength={140} value={caption} onChange={(e) => setCaption(e.target.value)} />
       </div>
       <div className="caption-chips" aria-live="polite">
-        {suggestions === null && <span className="hint">Thinking of captions...</span>}
+        {suggestions === null && (
+          <button type="button" className="small pill-blue" onClick={() => void suggest()} disabled={thinking || sending}>
+            {thinking ? "Thinking of captions..." : "✨ Suggest captions"}
+          </button>
+        )}
+        {captionNote && <span className="hint">{captionNote}</span>}
         {suggestions?.map((s) => (
           <button key={s} type="button" className="chip" onClick={() => setCaption(s)} title="Use this caption (you can still edit it)">
             {s}

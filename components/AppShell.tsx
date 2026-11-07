@@ -1,8 +1,10 @@
 "use client";
 
 // One screen at a time: a slim nav rail (a bottom tab bar on narrow windows),
-// a top bar with the study timer chip and avatar menu, a check-in banner, and
-// the current screen in a centred column. The New post modal is `?new=1`.
+// a top bar with the study timer chip and avatar menu, and the current screen
+// in a centred column. The New post modal is `?new=1`.
+// AI Lodge showcase: no accounts, so no sign-out (the avatar menu can reset the demo), and no automatic
+// group check-ins (they asked the AI every 5 minutes without a click; see original-supabase/).
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
@@ -13,7 +15,6 @@ import { useBooth } from "@/components/BoothProvider";
 import { PipProvider, formatLeft, useSessionLeft } from "@/components/Widget";
 import { Avatar, Modal } from "@/components/ui";
 
-const CHECKIN_EVERY_MS = 5 * 60_000;
 
 type Shell = {
   /** Opens the New post modal over the current screen. */
@@ -32,24 +33,22 @@ const TABS = [
   { href: "/group", label: "My Group", icon: <GroupIcon size={30} /> },
 ];
 
-export default function AppShell({ email, children }: { email: string; children: React.ReactNode }) {
+export default function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <PipProvider>
-      <Shell email={email}>{children}</Shell>
+      <Shell>{children}</Shell>
     </PipProvider>
   );
 }
 
-function Shell({ email, children }: { email: string; children: React.ReactNode }) {
+function Shell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const params = useSearchParams();
   const newOpen = params.get("new") === "1";
-  const { group, loading, error, checkins, refresh, selectGroup } = useBooth();
+  const { group, loading, error, selectGroup } = useBooth();
   const openedInApp = useRef(false);
   const [notice, setNotice] = useState<{ message: string; ok: boolean } | null>(null);
-  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
-  const [demoStatus, setDemoStatus] = useState("");
 
   const openNewPost = useCallback(() => {
     openedInApp.current = true;
@@ -72,56 +71,7 @@ function Shell({ email, children }: { email: string; children: React.ReactNode }
     return () => window.clearTimeout(t);
   }, [notice]);
 
-  // Smart check-ins: every open client asks every 5 minutes; the server rate-limits.
-  const askForCheckin = useCallback(
-    async (force = false) => {
-      if (!group) return;
-      const now = new Date();
-      const res = await fetch("/api/checkin", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          groupId: group.id,
-          localTime: now.toLocaleString([], { weekday: "long", hour: "numeric", minute: "2-digit" }),
-          localHour: now.getHours(),
-          force,
-        }),
-      }).catch(() => null);
-      const result = res ? ((await res.json().catch(() => ({}))) as { shouldNudge?: boolean; reason?: string }) : null;
-      if (result?.shouldNudge) await refresh();
-      return result;
-    },
-    [group, refresh],
-  );
-
-  useEffect(() => {
-    if (!group) return;
-    const first = window.setTimeout(() => void askForCheckin(), 20_000);
-    const every = window.setInterval(() => void askForCheckin(), CHECKIN_EVERY_MS);
-    return () => {
-      window.clearTimeout(first);
-      window.clearInterval(every);
-    };
-  }, [group, askForCheckin]);
-
-  // Hidden demo control: Ctrl+Shift+K forces a check-in now.
-  const forceCheckin = useCallback(async () => {
-    setDemoStatus("Asking for a check-in…");
-    const r = await askForCheckin(true);
-    setDemoStatus(r?.shouldNudge ? "" : (r?.reason ?? "no check-in"));
-    window.setTimeout(() => setDemoStatus(""), 4000);
-  }, [askForCheckin]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "k") void forceCheckin();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [forceCheckin]);
-
   const lateNight = useSyncExternalStore(subscribeMinute, isLateNight, () => false);
-  const checkin = checkins.find((c) => !dismissed.has(c.id));
 
   return (
     <ShellContext.Provider value={{ openNewPost, flash }}>
@@ -157,20 +107,10 @@ function Shell({ email, children }: { email: string; children: React.ReactNode }
             {lateNight && <span className="late-night-tag">still up? 🌙</span>}
             <div className="top-bar-right">
               <TimerChip />
-              <AvatarMenu email={email} />
+              <AvatarMenu />
             </div>
           </header>
 
-          {(checkin || demoStatus) && (
-            <div className="checkin-banner" role="status">
-              <span>{checkin && !demoStatus ? checkin.message : demoStatus}</span>
-              {checkin && !demoStatus && (
-                <button className="small" aria-label="Dismiss check-in" onClick={() => setDismissed((s) => new Set(s).add(checkin.id))}>
-                  ×
-                </button>
-              )}
-            </div>
-          )}
           {notice && (
             <p role="status" className={notice.ok ? "note-ok app-notice" : "note-held app-notice"}>
               {notice.message}
@@ -233,11 +173,11 @@ function TimerChip() {
   );
 }
 
-function AvatarMenu({ email }: { email: string }) {
-  const { me, group } = useBooth();
+function AvatarMenu() {
+  const { me, group, resetDemo } = useBooth();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const name = me?.display_name ?? email;
+  const name = me?.display_name ?? "You";
 
   useEffect(() => {
     if (!open) return;
@@ -258,13 +198,13 @@ function AvatarMenu({ email }: { email: string }) {
   return (
     <div className="avatar-menu" ref={ref}>
       <button className="avatar-button" aria-haspopup="menu" aria-expanded={open} aria-label={`Account: ${name}`} onClick={() => setOpen((o) => !o)}>
-        <Avatar id={me?.id ?? email} name={name} size={34} />
+        <Avatar id={me?.id ?? "me"} name={name} size={34} />
       </button>
       {open && (
         <div className="popover avatar-popover" role="menu">
           <div className="popover-head">
             <b>{name}</b>
-            <span className="hint">{group ? group.name : email}</span>
+            <span className="hint">{group?.name}</span>
           </div>
           <Link href="/settings" role="menuitem" className="popover-link" onClick={() => setOpen(false)}>
             Settings
@@ -272,11 +212,16 @@ function AvatarMenu({ email }: { email: string }) {
           <Link href="/group" role="menuitem" className="popover-link" onClick={() => setOpen(false)}>
             My Group
           </Link>
-          <form action="/auth/signout" method="post">
-            <button type="submit" role="menuitem" className="small">
-              Sign out
-            </button>
-          </form>
+          <button
+            role="menuitem"
+            className="small"
+            onClick={() => {
+              if (window.confirm("Clear your posts, timer and name from this browser?")) resetDemo();
+              setOpen(false);
+            }}
+          >
+            Reset demo
+          </button>
         </div>
       )}
     </div>
