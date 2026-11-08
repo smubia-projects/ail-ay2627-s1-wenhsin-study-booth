@@ -83,7 +83,7 @@ const esc = (s) => String(s ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 const md = [
   "# Red-team results",
   "",
-  `Run ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC against ${BASE_URL}. Model: ${env.VISION_MODEL_NAME || env.MODEL_NAME || "gemini-3.5-flash-lite"}${env.API_BASE_URL ? ` via ${env.API_BASE_URL}` : ""}.`,
+  `Run ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC against ${BASE_URL}. Model: ${env.VISION_MODEL_NAME || env.MODEL_NAME || "deepseek-v4-1-flash-260910"}${env.API_BASE_URL ? ` via ${env.API_BASE_URL}` : ""}.`,
   "",
   `**Overall: ${passed}/${rows.length} handled correctly (${rate}%)**. Target: at least 90%.`,
   "",

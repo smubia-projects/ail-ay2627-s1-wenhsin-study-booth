@@ -4,16 +4,16 @@
 // Any OpenAI-compatible chat-completions gateway (AI Lodge uses apiyi). Configuration comes only from env:
 //   API_KEY             required
 //   API_BASE_URL        optional, default https://api.apiyi.com/v1
-//   MODEL_NAME          text model (weekly story), default deepseek-v4-flash (JSON mode; DeepSeek has no json_schema)
-//   VISION_MODEL_NAME   vision model (moderation, captions), default gemini-3.5-flash-lite (DeepSeek has no vision)
+//   MODEL_NAME          text model (weekly story), default deepseek-v4-1-flash-260910 (JSON mode + zod)
+//   VISION_MODEL_NAME   vision model (moderation, captions), default deepseek-v4-1-flash-260910 (v4.1 reads images)
 // The original called Anthropic's Messages API (ANTHROPIC_* env vars); those names are read as fallbacks.
 // The original Anthropic version is kept in original-supabase/lib/ai.ts.
 import { z } from "zod";
 
 export type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
 
-const DEFAULT_MODEL = "deepseek-v4-flash";
-const DEFAULT_VISION_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "deepseek-v4-1-flash-260910";
+const DEFAULT_VISION_MODEL = "deepseek-v4-1-flash-260910";
 
 export function aiConfig() {
   const model = process.env.MODEL_NAME?.trim() || process.env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
@@ -66,6 +66,8 @@ export async function askJson<T extends z.ZodType>(opts: {
         model,
         max_tokens: opts.maxTokens ?? 2000,
         response_format: { type: "json_object" },
+        // DeepSeek thinks first by default; every call here has a timeout (captions 8 s), so thinking is off.
+        ...(/deepseek/i.test(model) ? { reasoning_effort: "none" } : {}),
         messages: [
           {
             role: "system",
